@@ -1,5 +1,5 @@
-use sqlx::{PgPool, Result};
 use crate::db::models::Transaction;
+use sqlx::{PgPool, Result};
 
 pub async fn insert_transaction(pool: &PgPool, tx: &Transaction) -> Result<Transaction> {
     sqlx::query_as!(
@@ -14,13 +14,9 @@ pub async fn insert_transaction(pool: &PgPool, tx: &Transaction) -> Result<Trans
 }
 
 pub async fn get_transaction(pool: &PgPool, id: i32) -> Result<Transaction> {
-    sqlx::query_as!(
-        Transaction,
-        "SELECT * FROM transactions WHERE id = $1",
-        id
-    )
-    .fetch_one(pool)
-    .await
+    sqlx::query_as!(Transaction, "SELECT * FROM transactions WHERE id = $1", id)
+        .fetch_one(pool)
+        .await
 }
 
 pub async fn list_transactions(pool: &PgPool, limit: i64, offset: i64) -> Result<Vec<Transaction>> {

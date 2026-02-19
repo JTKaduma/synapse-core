@@ -3,15 +3,16 @@ mod db;
 mod error;
 mod handlers;
 mod stellar;
+mod validation;
 
-use axum::{Router, extract::State, routing::get};
+use axum::{Router, extract::State, routing::get, routing::post};
 use sqlx::migrate::Migrator; // for Migrator
 use std::net::SocketAddr; // for SocketAddr
 use std::path::Path; // for Path
+use stellar::HorizonClient;
 use tokio::net::TcpListener; // for TcpListener
 use tracing_subscriber::prelude::*;
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt}; // for .with() on registry
-use stellar::HorizonClient;
 
 #[derive(Clone)] // <-- Add Clone
 pub struct AppState {
@@ -41,15 +42,22 @@ async fn main() -> anyhow::Result<()> {
 
     // Initialize Stellar Horizon client
     let horizon_client = HorizonClient::new(config.stellar_horizon_url.clone());
-    tracing::info!("Stellar Horizon client initialized with URL: {}", config.stellar_horizon_url);
+    tracing::info!(
+        "Stellar Horizon client initialized with URL: {}",
+        config.stellar_horizon_url
+    );
 
     // Build router with state
-    let app_state = AppState { 
+    let app_state = AppState {
         db: pool,
         horizon_client,
     };
     let app = Router::new()
         .route("/health", get(handlers::health))
+        .route(
+            "/callback/transaction",
+            post(handlers::webhook::transaction_callback),
+        )
         .with_state(app_state);
 
     let addr = SocketAddr::from(([0, 0, 0, 0], config.server_port));
@@ -60,4 +68,3 @@ async fn main() -> anyhow::Result<()> {
 
     Ok(())
 }
-
