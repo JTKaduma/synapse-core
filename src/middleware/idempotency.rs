@@ -10,6 +10,9 @@ use redis::Client;
 use serde::{Deserialize, Serialize};
 use std::time::Duration;
 
+const IDEMPOTENCY_KEY_MIN_LENGTH: usize = 1;
+const IDEMPOTENCY_KEY_MAX_LENGTH: usize = 255;
+
 #[derive(Clone)]
 pub struct IdempotencyService {
     client: Client,
@@ -143,6 +146,47 @@ impl IdempotencyService {
     }
 }
 
+/// Validates an idempotency key according to requirements:
+/// - Length: min 1, max 255 characters
+/// - Only alphanumeric, hyphens, underscores, and dots allowed
+/// - No control characters or whitespace
+/// - Trims leading/trailing whitespace before validation
+pub fn validate_idempotency_key(key: &str) -> Result<String, String> {
+    // Trim whitespace from the key
+    let trimmed_key = key.trim();
+
+    // Check empty after trimming
+    if trimmed_key.is_empty() {
+        return Err("Idempotency key cannot be empty or whitespace only".to_string());
+    }
+
+    // Check length
+    if trimmed_key.len() > IDEMPOTENCY_KEY_MAX_LENGTH {
+        return Err(format!(
+            "Idempotency key exceeds maximum length of {} characters",
+            IDEMPOTENCY_KEY_MAX_LENGTH
+        ));
+    }
+
+    // Check for invalid characters (only alphanumeric, hyphens, underscores, dots)
+    if !trimmed_key
+        .chars()
+        .all(|c| c.is_alphanumeric() || c == '-' || c == '_' || c == '.')
+    {
+        return Err(
+            "Idempotency key must contain only alphanumeric characters, hyphens, underscores, and dots"
+                .to_string(),
+        );
+    }
+
+    // Check for control characters (just to be safe)
+    if trimmed_key.chars().any(|c| c.is_control() || c.is_whitespace()) {
+        return Err("Idempotency key cannot contain control characters or whitespace".to_string());
+    }
+
+    Ok(trimmed_key.to_string())
+}
+
 /// Middleware to handle idempotency for webhook requests
 pub async fn idempotency_middleware(
     State(service): State<IdempotencyService>,
@@ -167,7 +211,21 @@ pub async fn idempotency_middleware(
         }
     };
 
-    match service.check_idempotency(&idempotency_key).await {
+    // Validate the idempotency key
+    let validated_key = match validate_idempotency_key(&idempotency_key) {
+        Ok(key) => key,
+        Err(error_message) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({
+                    "error": error_message
+                })),
+            )
+                .into_response();
+        }
+    };
+
+    match service.check_idempotency(&validated_key).await {
         Ok(IdempotencyStatus::New) => {
             let response: Response = next.run(request).await;
 
@@ -175,11 +233,11 @@ pub async fn idempotency_middleware(
                 let status = response.status().as_u16();
                 let body = serde_json::json!({"status": "success"}).to_string();
 
-                if let Err(e) = service.store_response(&idempotency_key, status, body).await {
+                if let Err(e) = service.store_response(&validated_key, status, body).await {
                     tracing::error!("Failed to store idempotency response: {}", e);
                 }
             } else {
-                if let Err(e) = service.release_lock(&idempotency_key).await {
+                if let Err(e) = service.release_lock(&validated_key).await {
                     tracing::error!("Failed to release idempotency lock: {}", e);
                 }
             }
@@ -213,3 +271,81 @@ pub async fn idempotency_middleware(
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_valid_keys() {
+        // Valid alphanumeric keys
+        assert!(validate_idempotency_key("abc123").is_ok());
+        assert!(validate_idempotency_key("ABC123").is_ok());
+        assert!(validate_idempotency_key("abc-def").is_ok());
+        assert!(validate_idempotency_key("abc_def").is_ok());
+        assert!(validate_idempotency_key("abc.def").is_ok());
+        assert!(validate_idempotency_key("a-b_c.d123").is_ok());
+    }
+
+    #[test]
+    fn test_valid_keys_with_whitespace_trimming() {
+        // Keys with leading/trailing whitespace should be trimmed
+        assert!(validate_idempotency_key("  abc123  ").is_ok());
+        let result = validate_idempotency_key("  abc123  ");
+        assert_eq!(result.unwrap(), "abc123");
+    }
+
+    #[test]
+    fn test_empty_key() {
+        let result = validate_idempotency_key("");
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("empty"));
+    }
+
+    #[test]
+    fn test_whitespace_only_key() {
+        let result = validate_idempotency_key("   ");
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("empty"));
+    }
+
+    #[test]
+    fn test_overlong_key() {
+        let long_key = "a".repeat(256);
+        let result = validate_idempotency_key(&long_key);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("exceeds maximum length"));
+    }
+
+    #[test]
+    fn test_max_length_key() {
+        let max_key = "a".repeat(255);
+        assert!(validate_idempotency_key(&max_key).is_ok());
+    }
+
+    #[test]
+    fn test_invalid_characters() {
+        // Keys with special characters should fail
+        assert!(validate_idempotency_key("abc@def").is_err());
+        assert!(validate_idempotency_key("abc#def").is_err());
+        assert!(validate_idempotency_key("abc/def").is_err());
+        assert!(validate_idempotency_key("abc def").is_err());
+        assert!(validate_idempotency_key("abc\tdef").is_err());
+    }
+
+    #[test]
+    fn test_control_characters() {
+        // Keys with control characters should fail
+        assert!(validate_idempotency_key("abc\x00def").is_err());
+        assert!(validate_idempotency_key("abc\ndef").is_err());
+        assert!(validate_idempotency_key("abc\rdef").is_err());
+    }
+
+    #[test]
+    fn test_single_character_key() {
+        // Single character keys should be valid if alphanumeric
+        assert!(validate_idempotency_key("a").is_ok());
+        assert!(validate_idempotency_key("1").is_ok());
+    }
+}
+
