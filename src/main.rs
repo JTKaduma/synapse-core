@@ -15,7 +15,7 @@ use synapse_core::{
     metrics,
     middleware::idempotency::IdempotencyService,
     schemas,
-    services::{FeatureFlagService, SettlementService, WebhookDispatcher},
+    services::{FeatureFlagService, LeaderElection, SettlementService, WebhookDispatcher},
     stellar::HorizonClient,
     telemetry,
     ApiState, AppState, ReadinessState,
@@ -265,6 +265,30 @@ async fn serve(config: config::Config) -> anyhow::Result<()> {
         pool_monitor_task(monitor_pool).await;
     });
 
+    // Start leader election + heartbeat background task
+    let le_redis_url = config.redis_url.clone();
+    tokio::spawn(async move {
+        let election = match LeaderElection::new(&le_redis_url) {
+            Ok(e) => e,
+            Err(e) => {
+                tracing::warn!("Leader election unavailable (Redis?): {e}");
+                return;
+            }
+        };
+        tracing::info!(instance_id = election.instance_id(), "Leader election started");
+        let mut interval = tokio::time::interval(tokio::time::Duration::from_secs(10));
+        loop {
+            interval.tick().await;
+            let _ = election.publish_heartbeat().await;
+            match election.try_acquire_leadership().await {
+                Ok(true) => tracing::debug!(instance_id = election.instance_id(), "Leader"),
+                Ok(false) => tracing::debug!(instance_id = election.instance_id(), "Follower"),
+                Err(e) => tracing::warn!("Leader election error: {e}"),
+            }
+        }
+    });
+    tracing::info!("Leader election background task started");
+
     let _api_routes: Router = Router::new()
         .route("/health", get(handlers::health))
         .route("/settlements", get(handlers::settlements::list_settlements))
@@ -324,6 +348,10 @@ async fn serve(config: config::Config) -> anyhow::Result<()> {
         .route(
             "/settlements/:id",
             get(handlers::settlements::get_settlement),
+        )
+        .route(
+            "/admin/instances",
+            get(handlers::admin::list_active_instances),
         )
         .with_state(api_state);
 
