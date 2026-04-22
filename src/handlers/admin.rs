@@ -1,93 +1,103 @@
-use axum::{http::StatusCode, response::Json, extract::State};
-use serde_json::json;
-use crate::AppState;
-use sqlx::FromRow;
-use chrono::{DateTime, Utc};
+use crate::middleware::quota::{Quota, QuotaManager, QuotaStatus, ResetSchedule, Tier};
+use axum::{
+    extract::{Path, State},
+    http::StatusCode,
+    Json,
+    Router,
+};
+use serde::{Deserialize, Serialize};
 
-#[derive(FromRow)]
-struct WebhookEndpoint {
-    id: uuid::Uuid,
-    url: String,
-    circuit_state: String,
-    circuit_failure_count: i32,
-    circuit_opened_at: Option<DateTime<Utc>>,
+#[derive(Clone)]
+pub struct AdminState {
+    pub quota_manager: QuotaManager,
 }
 
-pub async fn get_circuit_breakers(
-    State(state): State<AppState>,
-) -> Result<Json<serde_json::Value>, StatusCode> {
-    // TODO: Add admin authentication check
+#[derive(Debug, Serialize, Deserialize)]
+pub struct SetQuotaRequest {
+    pub tier: String,
+    pub custom_limit: Option<u32>,
+    pub reset_schedule: String,
+}
 
-    let now = Utc::now();
+#[derive(Debug, Serialize)]
+pub struct QuotaResponse {
+    pub key: String,
+    pub tier: String,
+    pub limit: u32,
+    pub used: u32,
+    pub remaining: u32,
+    pub reset_in_seconds: u64,
+}
 
-    // Horizon breaker
-    let horizon_state = state.horizon_breaker.get_state().await;
-    let horizon_time_in_state = if let Some(opened_at) = horizon_state.opened_at {
-        now.signed_duration_since(opened_at).num_seconds()
-    } else {
-        0
+/// Get quota status for a key
+pub async fn get_quota_status(
+    State(state): State<AdminState>,
+    Path(key): Path<String>,
+) -> Result<Json<QuotaStatus>, (StatusCode, String)> {
+    state
+        .quota_manager
+        .check_quota(&key)
+        .await
+        .map(Json)
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))
+}
+
+/// Set quota configuration for a key
+pub async fn set_quota(
+    State(state): State<AdminState>,
+    Path(key): Path<String>,
+    Json(req): Json<SetQuotaRequest>,
+) -> Result<StatusCode, (StatusCode, String)> {
+    let tier = match req.tier.to_lowercase().as_str() {
+        "free" => Tier::Free,
+        "standard" => Tier::Standard,
+        "premium" => Tier::Premium,
+        _ => return Err((StatusCode::BAD_REQUEST, "Invalid tier".to_string())),
     };
 
-    // Redis breaker
-    let redis_state = state.redis_breaker.get_state().await;
-    let redis_time_in_state = if let Some(opened_at) = redis_state.opened_at {
-        now.signed_duration_since(opened_at).num_seconds()
-    } else {
-        0
+    let reset_schedule = match req.reset_schedule.to_lowercase().as_str() {
+        "hourly" => ResetSchedule::Hourly,
+        "daily" => ResetSchedule::Daily,
+        "monthly" => ResetSchedule::Monthly,
+        _ => {
+            return Err((
+                StatusCode::BAD_REQUEST,
+                "Invalid reset schedule".to_string(),
+            ))
+        }
     };
 
-    // Postgres breaker
-    let postgres_state = state.postgres_breaker.get_state().await;
-    let postgres_time_in_state = if let Some(opened_at) = postgres_state.opened_at {
-        now.signed_duration_since(opened_at).num_seconds()
-    } else {
-        0
+    let quota = Quota {
+        tier,
+        custom_limit: req.custom_limit,
+        reset_schedule,
     };
 
-    // Webhook endpoints
-    let webhook_endpoints: Vec<WebhookEndpoint> = sqlx::query_as(
-        "SELECT id, url, circuit_state, circuit_failure_count, circuit_opened_at FROM webhook_endpoints"
-    )
-    .fetch_all(&state.db)
-    .await
-    .unwrap_or_default(); // If table doesn't exist, empty list
+    state
+        .quota_manager
+        .set_quota_config(&key, &quota)
+        .await
+        .map(|_| StatusCode::OK)
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))
+}
 
-    let webhook_states: Vec<serde_json::Value> = webhook_endpoints.into_iter().map(|ep| {
-        let time_in_state = if let Some(opened_at) = ep.circuit_opened_at {
-            now.signed_duration_since(opened_at).num_seconds()
-        } else {
-            0
-        };
-        json!({
-            "id": ep.id,
-            "url": ep.url,
-            "state": ep.circuit_state,
-            "failure_count": ep.circuit_failure_count,
-            "time_in_current_state": time_in_state
-        })
-    }).collect();
+/// Reset quota usage for a key
+pub async fn reset_quota(
+    State(state): State<AdminState>,
+    Path(key): Path<String>,
+) -> Result<StatusCode, (StatusCode, String)> {
+    state
+        .quota_manager
+        .reset_quota(&key)
+        .await
+        .map(|_| StatusCode::OK)
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))
+}
 
-    let response = json!({
-        "horizon": {
-            "state": horizon_state.state,
-            "failure_count": horizon_state.failure_count,
-            "time_in_current_state": horizon_time_in_state,
-            "last_error": horizon_state.last_error
-        },
-        "redis": {
-            "state": redis_state.state,
-            "failure_count": redis_state.failure_count,
-            "time_in_current_state": redis_time_in_state,
-            "last_error": redis_state.last_error
-        },
-        "postgres": {
-            "state": postgres_state.state,
-            "failure_count": postgres_state.failure_count,
-            "time_in_current_state": postgres_time_in_state,
-            "last_error": postgres_state.last_error
-        },
-        "webhook_endpoints": webhook_states
-    });
-
-    Ok(Json(response))
+pub fn admin_routes() -> axum::Router<AdminState> {
+    use axum::routing::{get, post};
+    axum::Router::new()
+        .route("/quota/:key", get(get_quota_status))
+        .route("/quota/:key", post(set_quota))
+        .route("/quota/:key/reset", post(reset_quota))
 }
