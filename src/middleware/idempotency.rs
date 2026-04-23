@@ -512,13 +512,13 @@ pub async fn idempotency_middleware(
                     .body(Body::from(body_bytes))
                     .unwrap();
 
-                if let Err(e) = service.store_response(&idempotency_key, status, body_string, content_type).await {
+                if let Err(e) = service.store_response(&validated_key, status, body).await {
                     tracing::error!("Failed to store idempotency response: {}", e);
                 }
                 
                 client_response
             } else {
-                if let Err(e) = service.release_lock(&idempotency_key).await {
+                if let Err(e) = service.release_lock(&validated_key).await {
                     tracing::error!("Failed to release idempotency lock: {}", e);
                 }
                 response
@@ -575,3 +575,47 @@ pub async fn idempotency_middleware(
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_validate_idempotency_key_success() {
+        assert_eq!(validate_idempotency_key("abc123").unwrap(), "abc123");
+        assert_eq!(validate_idempotency_key("abc-def_123.45").unwrap(), "abc-def_123.45");
+        assert_eq!(validate_idempotency_key("  abc123  ").unwrap(), "abc123");
+    }
+
+    #[test]
+    fn test_validate_idempotency_key_empty_or_whitespace() {
+        assert!(validate_idempotency_key("").is_err());
+        assert!(validate_idempotency_key("   ").is_err());
+    }
+
+    #[test]
+    fn test_validate_idempotency_key_invalid_characters() {
+        assert!(validate_idempotency_key("abc def").is_err());
+        assert!(validate_idempotency_key("abc@def").is_err());
+        assert!(validate_idempotency_key("abc/def").is_err());
+        assert!(validate_idempotency_key("abc\tdef").is_err());
+    }
+
+    #[test]
+    fn test_validate_idempotency_key_control_characters() {
+        assert!(validate_idempotency_key("abc\n123").is_err());
+        assert!(validate_idempotency_key("abc\r123").is_err());
+        assert!(validate_idempotency_key("abc\x00").is_err());
+    }
+
+    #[test]
+    fn test_validate_idempotency_key_length_limits() {
+        let max_key = "a".repeat(IDEMPOTENCY_KEY_MAX_LENGTH);
+        assert!(validate_idempotency_key(&max_key).is_ok());
+
+        let too_long_key = "a".repeat(IDEMPOTENCY_KEY_MAX_LENGTH + 1);
+        assert!(validate_idempotency_key(&too_long_key).is_err());
+    }
+}
+
+

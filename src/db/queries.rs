@@ -559,3 +559,68 @@ pub async fn get_asset_stats(pool: &PgPool) -> Result<Vec<AssetStats>> {
         })
         .collect())
 }
+
+// --- Idempotency Fallback Queries ---
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct IdempotencyKey {
+    pub key: String,
+    pub status: String,
+    pub response: Option<serde_json::Value>,
+    pub created_at: DateTime<Utc>,
+    pub expires_at: DateTime<Utc>,
+}
+
+pub async fn check_idempotency_key(pool: &PgPool, key: &str) -> Result<Option<IdempotencyKey>> {
+    sqlx::query_as::<_, IdempotencyKey>(
+        "SELECT key, status, response, created_at, expires_at FROM idempotency_keys WHERE key = $1 AND expires_at > NOW()",
+    )
+    .bind(key)
+    .fetch_optional(pool)
+    .await
+}
+
+pub async fn insert_idempotency_key(
+    pool: &PgPool,
+    key: &str,
+    status: &str,
+    response: Option<&serde_json::Value>,
+    expires_at: DateTime<Utc>,
+) -> Result<()> {
+    sqlx::query(
+        r#"
+        INSERT INTO idempotency_keys (key, status, response, expires_at)
+        VALUES ($1, $2, $3, $4)
+        ON CONFLICT (key) DO NOTHING
+        "#,
+    )
+    .bind(key)
+    .bind(status)
+    .bind(response)
+    .bind(expires_at)
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
+pub async fn update_idempotency_key_response(
+    pool: &PgPool,
+    key: &str,
+    response: &serde_json::Value,
+) -> Result<()> {
+    sqlx::query(
+        "UPDATE idempotency_keys SET response = $2, status = 'completed' WHERE key = $1",
+    )
+    .bind(key)
+    .bind(response)
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
+pub async fn cleanup_expired_idempotency_keys(pool: &PgPool) -> Result<u64> {
+    let result = sqlx::query("DELETE FROM idempotency_keys WHERE expires_at <= NOW()")
+        .execute(pool)
+        .await?;
+    Ok(result.rows_affected())
+}
