@@ -33,6 +33,7 @@ use axum::{
     Router,
 };
 use std::collections::HashMap;
+use std::sync::atomic::AtomicU64;
 use std::sync::Arc;
 use tokio::sync::broadcast;
 use uuid::Uuid;
@@ -50,6 +51,12 @@ pub struct AppState {
     pub query_cache: QueryCache,
     pub profiling_manager: ProfilingManager,
     pub tenant_configs: Arc<tokio::sync::RwLock<HashMap<Uuid, TenantConfig>>>,
+    pub idempotency_cache_hits: Arc<AtomicU64>,
+    pub idempotency_cache_misses: Arc<AtomicU64>,
+    pub idempotency_lock_acquired: Arc<AtomicU64>,
+    pub idempotency_lock_contention: Arc<AtomicU64>,
+    pub idempotency_errors: Arc<AtomicU64>,
+    pub idempotency_fallback_count: Arc<AtomicU64>,
 }
 
 impl AppState {
@@ -82,6 +89,12 @@ impl AppState {
             query_cache: QueryCache::new("redis://localhost:6379").unwrap(),
             profiling_manager: ProfilingManager::new(),
             tenant_configs: Arc::new(tokio::sync::RwLock::new(HashMap::new())),
+            idempotency_cache_hits: Arc::new(AtomicU64::new(0)),
+            idempotency_cache_misses: Arc::new(AtomicU64::new(0)),
+            idempotency_lock_acquired: Arc::new(AtomicU64::new(0)),
+            idempotency_lock_contention: Arc::new(AtomicU64::new(0)),
+            idempotency_errors: Arc::new(AtomicU64::new(0)),
+            idempotency_fallback_count: Arc::new(AtomicU64::new(0)),
         }
     }
 }

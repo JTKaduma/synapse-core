@@ -5,7 +5,7 @@ use axum::{
 };
 use clap::Parser;
 use sqlx::migrate::Migrator;
-use std::{net::SocketAddr, path::Path};
+use std::{net::SocketAddr, path::Path, sync::Arc, sync::atomic::AtomicU64};
 use synapse_core::{
     config, db,
     db::pool_manager::PoolManager,
@@ -218,7 +218,22 @@ async fn serve(config: config::Config) -> anyhow::Result<()> {
     );
 
     // Initialize Redis idempotency service
-    let _idempotency_service = IdempotencyService::new(&config.redis_url)?;
+    let idempotency_cache_hits = Arc::new(AtomicU64::new(0));
+    let idempotency_cache_misses = Arc::new(AtomicU64::new(0));
+    let idempotency_lock_acquired = Arc::new(AtomicU64::new(0));
+    let idempotency_lock_contention = Arc::new(AtomicU64::new(0));
+    let idempotency_errors = Arc::new(AtomicU64::new(0));
+    let idempotency_fallback_count = Arc::new(AtomicU64::new(0));
+    let _idempotency_service = IdempotencyService::new(
+        &config.redis_url,
+        pool.clone(),
+        Arc::clone(&idempotency_cache_hits),
+        Arc::clone(&idempotency_cache_misses),
+        Arc::clone(&idempotency_lock_acquired),
+        Arc::clone(&idempotency_lock_contention),
+        Arc::clone(&idempotency_errors),
+        Arc::clone(&idempotency_fallback_count),
+    )?;
     tracing::info!("Redis idempotency service initialized");
 
     // Initialize query cache
@@ -253,6 +268,12 @@ async fn serve(config: config::Config) -> anyhow::Result<()> {
         query_cache,
         profiling_manager: crate::handlers::profiling::ProfilingManager::new(),
         tenant_configs: std::sync::Arc::new(tokio::sync::RwLock::new(std::collections::HashMap::new())),
+        idempotency_cache_hits: Arc::clone(&idempotency_cache_hits),
+        idempotency_cache_misses: Arc::clone(&idempotency_cache_misses),
+        idempotency_lock_acquired: Arc::clone(&idempotency_lock_acquired),
+        idempotency_lock_contention: Arc::clone(&idempotency_lock_contention),
+        idempotency_errors: Arc::clone(&idempotency_errors),
+        idempotency_fallback_count: Arc::clone(&idempotency_fallback_count),
     };
 
     let graphql_schema = build_schema(app_state.clone());
