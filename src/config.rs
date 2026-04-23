@@ -32,6 +32,7 @@ pub struct Config {
     pub backup_dir: String,
     pub backup_encryption_key: Option<String>,
     pub otlp_endpoint: Option<String>,
+    pub webhook_delivery_concurrency: usize,
 }
 
 pub mod assets;
@@ -87,6 +88,10 @@ impl Config {
             backup_dir: env::var("BACKUP_DIR").unwrap_or_else(|_| "./backups".to_string()),
             backup_encryption_key: env::var("BACKUP_ENCRYPTION_KEY").ok(),
             otlp_endpoint: env::var("OTLP_ENDPOINT").ok(),
+            webhook_delivery_concurrency: env::var("WEBHOOK_DELIVERY_CONCURRENCY")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(10),
         })
     }
 }

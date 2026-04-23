@@ -46,6 +46,9 @@ pub async fn health(State(state): State<ApiState>) -> impl IntoResponse {
         usage_percent,
     };
 
+    // Get Redis circuit breaker state from query_cache
+    let redis_circuit_state = state.app_state.query_cache.circuit_state();
+
     let health_response = HealthStatus {
         status: if db_status == "connected" {
             "healthy".to_string()
@@ -55,6 +58,7 @@ pub async fn health(State(state): State<ApiState>) -> impl IntoResponse {
         version: "0.1.0".to_string(),
         db: db_status.to_string(),
         db_pool: pool_stats,
+        redis_circuit: redis_circuit_state,
     };
 
     // Return 503 if database is down, 200 otherwise
@@ -97,6 +101,7 @@ pub struct HealthStatus {
     pub version: String,
     pub db: String,
     pub db_pool: DbPoolStats,
+    pub redis_circuit: String,
 }
 
 #[derive(Debug, Serialize, Deserialize, ToSchema)]
