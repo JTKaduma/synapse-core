@@ -8,6 +8,8 @@ on:
 
 env:
   CARGO_TERM_COLOR: always
+  RUSTC_WRAPPER: sccache
+  SCCACHE_CACHE_SIZE: 1G
 
 jobs:
   build:
@@ -55,6 +57,9 @@ jobs:
     - name: Install sqlx-cli
       run: cargo install sqlx-cli --no-default-features --features postgres
 
+    - name: Start sccache
+      run: sccache --start-server
+
     - name: Run migrations
       run: sqlx migrate run
       env:
@@ -74,3 +79,6 @@ jobs:
       run: cargo test --verbose
       env:
         DATABASE_URL: postgres://synapse:synapse@localhost:5432/synapse_test
+
+    - name: Stop sccache
+      run: sccache --stop-server
