@@ -79,6 +79,10 @@ impl ProcessingStage for CompleteStage {
                 .fetch_one(&self.pool)
                 .await?;
 
+        // Validate status transition: current status → completed
+        crate::validation::state_machine::validate_status_transition(&tx.status, "completed")
+            .map_err(|e| anyhow::anyhow!("{}", e))?;
+
         sqlx::query(
             "UPDATE transactions SET status = 'completed', updated_at = NOW() WHERE id = $1",
         )
@@ -211,12 +215,16 @@ impl TransactionProcessor {
                 .fetch_one(&self.pool)
                 .await?;
 
-        // Get asset_code for cache invalidation
-        let asset_code: String =
-            sqlx::query_scalar("SELECT asset_code FROM transactions WHERE id = $1")
+        // Get current status and asset_code
+        let (current_status, asset_code): (String, String) =
+            sqlx::query_as("SELECT status, asset_code FROM transactions WHERE id = $1")
                 .bind(tx_id)
                 .fetch_one(&self.pool)
                 .await?;
+
+        // Validate status transition: current status → pending
+        crate::validation::state_machine::validate_status_transition(&current_status, "pending")
+            .map_err(|e| anyhow::anyhow!("{}", e))?;
 
         sqlx::query("UPDATE transactions SET status = 'pending', updated_at = NOW() WHERE id = $1")
             .bind(tx_id)
