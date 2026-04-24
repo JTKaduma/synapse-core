@@ -163,5 +163,8 @@ pub fn create_app(app_state: AppState) -> Router {
         .route("/stats/daily", get(handlers::stats::daily_totals))
         .route("/stats/assets", get(handlers::stats::asset_stats))
         .route("/cache/metrics", get(handlers::stats::cache_metrics))
+        .layer(axum_middleware::from_fn(
+            middleware::panic_recovery::panic_recovery_middleware,
+        ))
         .with_state(api_state)
 }

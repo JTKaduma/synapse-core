@@ -1,6 +1,7 @@
 pub mod auth;
 pub mod idempotency;
 pub mod ip_filter;
+pub mod panic_recovery;
 pub mod quota;
 pub mod request_logger;
 pub mod validate;
