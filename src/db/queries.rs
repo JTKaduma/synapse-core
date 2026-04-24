@@ -22,62 +22,65 @@ pub async fn get_all_tenant_configs(pool: &PgPool) -> Result<Vec<TenantConfig>> 
 // --- Transaction Queries ---
 
 pub async fn insert_transaction(pool: &PgPool, tx: &Transaction) -> Result<Transaction> {
-    let mut db_tx = pool.begin().await?;
+    crate::utils::retry::retry_with_backoff("insert_transaction", 3, 100, || async {
+        let mut db_tx = pool.begin().await?;
 
-    let result = sqlx::query_as::<_, Transaction>(
-        r#"
-        INSERT INTO transactions (
-            id, stellar_account, amount, asset_code, status,
-            created_at, updated_at, anchor_transaction_id, callback_type, callback_status,
-            settlement_id, memo, memo_type, metadata
-        ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14)
-        RETURNING *
-        "#,
-    )
-    .bind(tx.id)
-    .bind(&tx.stellar_account)
-    .bind(&tx.amount)
-    .bind(&tx.asset_code)
-    .bind(&tx.status)
-    .bind(tx.created_at)
-    .bind(tx.updated_at)
-    .bind(&tx.anchor_transaction_id)
-    .bind(&tx.callback_type)
-    .bind(&tx.callback_status)
-    .bind(tx.settlement_id)
-    .bind(&tx.memo)
-    .bind(&tx.memo_type)
-    .bind(&tx.metadata)
-    .fetch_one(&mut *db_tx)
-    .await?;
+        let result = sqlx::query_as::<_, Transaction>(
+            r#"
+            INSERT INTO transactions (
+                id, stellar_account, amount, asset_code, status,
+                created_at, updated_at, anchor_transaction_id, callback_type, callback_status,
+                settlement_id, memo, memo_type, metadata
+            ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14)
+            RETURNING *
+            "#,
+        )
+        .bind(tx.id)
+        .bind(&tx.stellar_account)
+        .bind(&tx.amount)
+        .bind(&tx.asset_code)
+        .bind(&tx.status)
+        .bind(tx.created_at)
+        .bind(tx.updated_at)
+        .bind(&tx.anchor_transaction_id)
+        .bind(&tx.callback_type)
+        .bind(&tx.callback_status)
+        .bind(tx.settlement_id)
+        .bind(&tx.memo)
+        .bind(&tx.memo_type)
+        .bind(&tx.metadata)
+        .fetch_one(&mut *db_tx)
+        .await?;
 
-    // Audit log: transaction created
-    AuditLog::log_creation(
-        &mut db_tx,
-        result.id,
-        ENTITY_TRANSACTION,
-        json!({
-            "stellar_account": result.stellar_account,
-            "amount": result.amount.to_string(),
-            "asset_code": result.asset_code,
-            "status": result.status,
-            "anchor_transaction_id": result.anchor_transaction_id,
-            "callback_type": result.callback_type,
-            "callback_status": result.callback_status,
-            "memo": result.memo,
-            "memo_type": result.memo_type,
-            "metadata": result.metadata,
-        }),
-        "system",
-    )
-    .await?;
+        // Audit log: transaction created
+        AuditLog::log_creation(
+            &mut db_tx,
+            result.id,
+            ENTITY_TRANSACTION,
+            json!({
+                "stellar_account": result.stellar_account,
+                "amount": result.amount.to_string(),
+                "asset_code": result.asset_code,
+                "status": result.status,
+                "anchor_transaction_id": result.anchor_transaction_id,
+                "callback_type": result.callback_type,
+                "callback_status": result.callback_status,
+                "memo": result.memo,
+                "memo_type": result.memo_type,
+                "metadata": result.metadata,
+            }),
+            "system",
+        )
+        .await?;
 
-    db_tx.commit().await?;
+        db_tx.commit().await?;
 
-    // Invalidate cache after successful commit
-    invalidate_transaction_caches(&result.asset_code).await;
+        // Invalidate cache after successful commit
+        invalidate_transaction_caches(&result.asset_code).await;
 
-    Ok(result)
+        Ok(result)
+    })
+    .await
 }
 
 pub async fn get_transaction(pool: &PgPool, id: Uuid) -> Result<Transaction> {
