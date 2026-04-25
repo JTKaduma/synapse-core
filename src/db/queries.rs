@@ -1,5 +1,6 @@
 use crate::db::audit::{AuditLog, ENTITY_TRANSACTION};
 use crate::db::models::{Settlement, Transaction};
+use crate::db::slow_query;
 use crate::tenant::TenantConfig;
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};

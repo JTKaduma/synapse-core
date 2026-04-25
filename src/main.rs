@@ -289,6 +289,7 @@ async fn serve(config: config::Config) -> anyhow::Result<()> {
         )),
         pending_queue_depth: pending_queue_depth.clone(),
         current_batch_size: current_batch_size.clone(),
+        metrics_handle,
     };
 
     tokio::spawn(async move {
