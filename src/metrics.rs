@@ -233,3 +233,31 @@ pub async fn metrics_auth_middleware<B>(
 ) -> Result<axum::response::Response, axum::http::StatusCode> {
     Ok(next.run(request).await)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_metrics_initialization() {
+        let handle = init_metrics().expect("Failed to initialize metrics");
+        // Should not panic
+        assert!(handle.render_metrics().is_ok());
+    }
+
+    #[test]
+    fn test_db_pool_stats_update() {
+        let handle = init_metrics().expect("Failed to initialize metrics");
+        handle.update_db_pool_stats(10, 5, 50);
+        // Stats should be recorded
+    }
+
+    #[test]
+    fn test_queue_depth_update() {
+        let handle = init_metrics().expect("Failed to initialize metrics");
+        handle.update_queue_depth(100);
+        // Queue depth should be recorded
+    }
+}
+
+

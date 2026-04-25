@@ -57,6 +57,8 @@ pub struct AppState {
     pub pending_queue_depth: Arc<AtomicU64>,
     /// Current adaptive batch size, updated by the processor pool.
     pub current_batch_size: Arc<AtomicU64>,
+    /// Prometheus metrics handle
+    pub metrics_handle: crate::metrics::MetricsHandle,
 }
 
 impl AppState {
@@ -94,6 +96,7 @@ impl AppState {
             secrets_store: None,
             pending_queue_depth: Arc::new(AtomicU64::new(0)),
             current_batch_size: Arc::new(AtomicU64::new(10)),
+            metrics_handle: crate::metrics::init_metrics().unwrap(),
         }
     }
 }
