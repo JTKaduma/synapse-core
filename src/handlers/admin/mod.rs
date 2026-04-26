@@ -17,13 +17,21 @@ pub struct UpdateFlagRequest {
 }
 
 #[derive(Debug, Serialize, Deserialize)]
+pub struct UpdateRolloutPercentageRequest {
+    pub rollout_percentage: i32,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
 pub struct UpdateWebhookRateLimitRequest {
     pub max_delivery_rate: i32,
 }
 
 /// Create admin routes for queue management
 pub fn admin_routes() -> Router<sqlx::PgPool> {
-    Router::new().route("/flags", get(|| async { StatusCode::NOT_IMPLEMENTED }))
+    Router::new()
+        .route("/flags", get(get_flags))
+        .route("/flags/:name", post(update_flag))
+        .route("/flags/:name/rollout", post(update_rollout_percentage))
 }
 
 /// Create webhook replay admin routes
@@ -103,6 +111,44 @@ pub async fn update_flag(
         Ok(flag) => (StatusCode::OK, Json(flag)).into_response(),
         Err(e) => {
             tracing::error!("Failed to update feature flag '{}': {}", name, e);
+            (
+                StatusCode::NOT_FOUND,
+                Json(serde_json::json!({
+                    "error": format!("Feature flag '{}' not found", name)
+                })),
+            )
+                .into_response()
+        }
+    }
+}
+
+pub async fn update_rollout_percentage(
+    State(state): State<AppState>,
+    Path(name): Path<String>,
+    Json(payload): Json<UpdateRolloutPercentageRequest>,
+) -> impl IntoResponse {
+    if payload.rollout_percentage < 0 || payload.rollout_percentage > 100 {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({
+                "error": "rollout_percentage must be between 0 and 100"
+            })),
+        )
+            .into_response();
+    }
+
+    match state
+        .feature_flags
+        .update_rollout_percentage(&name, payload.rollout_percentage)
+        .await
+    {
+        Ok(flag) => (StatusCode::OK, Json(flag)).into_response(),
+        Err(e) => {
+            tracing::error!(
+                "Failed to update rollout percentage for '{}': {}",
+                name,
+                e
+            );
             (
                 StatusCode::NOT_FOUND,
                 Json(serde_json::json!({
