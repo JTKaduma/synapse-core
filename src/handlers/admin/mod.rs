@@ -41,6 +41,7 @@ pub fn admin_routes() -> Router<sqlx::PgPool> {
         .route("/flags/:name/rollout", post(update_rollout_percentage))
         .route("/feature-flags/history", get(get_flag_history))
         .route("/backup/status", get(get_backup_status))
+        .route("/backup/verification-history", get(get_backup_verification_history))
 }
 
 /// Create webhook replay admin routes
@@ -75,6 +76,40 @@ pub async fn get_backup_status(State(state): State<AppState>) -> impl IntoRespon
             })),
         )
             .into_response(),
+    }
+}
+
+pub async fn get_backup_verification_history(
+    State(pool): State<sqlx::PgPool>,
+    Query(params): Query<HistoryQuery>,
+) -> impl IntoResponse {
+    let limit = params.limit.unwrap_or(50).min(1000);
+    let offset = params.offset.unwrap_or(0);
+
+    match sqlx::query_as::<_, crate::services::backup::BackupVerificationLog>(
+        r#"
+        SELECT id, backup_filename, verification_status, row_count, latest_timestamp, error_message, verified_at
+        FROM backup_verification_logs
+        ORDER BY verified_at DESC
+        LIMIT $1 OFFSET $2
+        "#,
+    )
+    .bind(limit)
+    .bind(offset)
+    .fetch_all(&pool)
+    .await
+    {
+        Ok(history) => (StatusCode::OK, Json(history)).into_response(),
+        Err(e) => {
+            tracing::error!("Failed to get backup verification history: {}", e);
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({
+                    "error": "Failed to retrieve verification history"
+                })),
+            )
+                .into_response()
+        }
     }
 }
 
