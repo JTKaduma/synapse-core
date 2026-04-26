@@ -3,6 +3,7 @@ use crate::config::Config;
 
 pub mod models;
 pub mod queries;
+pub mod query_builder;
 
 pub async fn create_pool(config: &Config) -> Result<PgPool, sqlx::Error> {
     PgPoolOptions::new()
