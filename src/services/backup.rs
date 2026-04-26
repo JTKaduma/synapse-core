@@ -168,7 +168,56 @@ impl BackupService {
         Ok(())
     }
 
-    pub async fn apply_retention_policy(&self) -> Result<()> {
+    pub async fn restore_to_timestamp(&self, target_time: DateTime<Utc>) -> Result<()> {
+        let backups = self.list_backups().await?;
+
+        // Find the most recent backup before target time
+        let base_backup = backups
+            .iter()
+            .filter(|b| b.timestamp <= target_time)
+            .max_by_key(|b| b.timestamp)
+            .context("No backup found before target timestamp")?;
+
+        tracing::info!(
+            "Restoring to {} using base backup from {}",
+            target_time,
+            base_backup.timestamp
+        );
+
+        // Restore base backup
+        self.restore_backup(&base_backup.filename).await?;
+
+        // Apply WAL recovery to target time
+        self.apply_wal_recovery(target_time).await?;
+
+        tracing::info!("Point-in-time recovery completed to {}", target_time);
+
+        Ok(())
+    }
+
+    async fn apply_wal_recovery(&self, target_time: DateTime<Utc>) -> Result<()> {
+        let wal_dir = self.backup_dir.join("wal_archive");
+
+        if !wal_dir.exists() {
+            tracing::warn!("WAL archive directory not found, skipping WAL recovery");
+            return Ok(());
+        }
+
+        let recovery_conf = format!(
+            "recovery_target_timeline = 'latest'\nrecovery_target_xid = '0'\nrecovery_target_time = '{}'\nrecovery_target_inclusive = true\n",
+            target_time.to_rfc3339()
+        );
+
+        let recovery_path = self.backup_dir.join("recovery.conf");
+        fs::write(&recovery_path, recovery_conf)
+            .await
+            .context("Failed to write recovery.conf")?;
+
+        tracing::info!("WAL recovery configuration written");
+
+        Ok(())
+    }
+}
         let backups = self.list_backups().await?;
 
         let mut hourly_backups = Vec::new();
