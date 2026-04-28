@@ -1,5 +1,6 @@
 pub mod account_monitor;
 pub mod backup;
+pub mod backup_verification_job;
 pub mod feature_flags;
 pub mod lock_manager;
 pub mod processor;
@@ -13,6 +14,7 @@ pub mod webhook_dispatcher;
 
 pub use account_monitor::AccountMonitor;
 pub use backup::BackupService;
+pub use backup_verification_job::BackupVerificationJob;
 pub use feature_flags::FeatureFlagService;
 pub use lock_manager::LeaderElection;
 pub use query_cache::{CacheConfig, QueryCache};
