@@ -12,7 +12,6 @@ use reqwest::Client as HttpClient;
 use serde::{Deserialize, Serialize};
 use sha2::{Sha256, Sha512};
 use sqlx::{PgPool, Row};
-use std::collections::HashMap;
 use uuid::Uuid;
 
 const MAX_ATTEMPTS: i32 = 5;

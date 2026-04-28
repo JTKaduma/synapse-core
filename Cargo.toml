@@ -38,7 +38,7 @@ reqwest = { version = "0.11", features = ["json"] }
 failsafe = "1"
 clap = { version = "4", features = ["derive"] }
 tower = { version = "0.4", features = ["util"] }
-tower-http = { version = "0.4", features = ["cors"] }
+tower-http = { version = "0.4", features = ["cors", "limit"] }
 hyper = "0.14"
 arc-swap = "1"
 csv = "1"
@@ -61,7 +61,6 @@ sha2 = "0.10"
 hex = "0.4"
 pprof = { version = "0.13", features = ["flamegraph", "criterion"] }
 flate2 = "1.0"
-lru = "0.12"
 opentelemetry = { version = "0.22", features = ["metrics", "trace"] }
 opentelemetry_sdk = { version = "0.22", features = ["rt-tokio", "metrics", "trace"] }
 opentelemetry-otlp = { version = "0.15", features = [
