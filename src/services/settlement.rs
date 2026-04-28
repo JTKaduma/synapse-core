@@ -80,15 +80,39 @@ impl SettlementService {
             return Ok(vec![]);
         }
 
-        let total_tx = unsettled.len();
-        let batch_count = total_tx.div_ceil(self.max_batch_size);
-        tracing::info!(
-            asset = %asset_code,
-            total_transactions = total_tx,
-            batch_size = self.max_batch_size,
-            batches = batch_count,
-            "Starting settlement"
-        );
+        let tx_count = unsettled.len() as i32;
+        let total_amount: BigDecimal = unsettled
+            .iter()
+            .map(|t| t.amount.clone())
+            .fold(BigDecimal::from(0), |acc, x| acc + x);
+
+        // Find the range of transactions
+        let period_start = unsettled
+            .iter()
+            .map(|t| t.created_at)
+            .min()
+            .unwrap_or(end_time);
+        let period_end = unsettled
+            .iter()
+            .map(|t| t.updated_at)
+            .max()
+            .unwrap_or(end_time);
+
+        let settlement = Settlement {
+            id: Uuid::new_v4(),
+            asset_code: asset_code.to_string(),
+            total_amount,
+            tx_count,
+            period_start,
+            period_end,
+            status: "completed".to_string(),
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+            dispute_reason: None,
+            original_total_amount: None,
+            reviewed_by: None,
+            reviewed_at: None,
+        };
 
         let mut settlements = Vec::with_capacity(batch_count);
 
