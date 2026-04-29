@@ -7,11 +7,11 @@
 use chrono::Utc;
 use futures::stream::{self, StreamExt};
 use hmac::{Hmac, Mac};
-use redis::Client;
+use redis::{AsyncCommands, Client};
 use reqwest::Client as HttpClient;
 use serde::{Deserialize, Serialize};
 use sha2::{Sha256, Sha512};
-use sqlx::PgPool;
+use sqlx::{PgPool, Row};
 use uuid::Uuid;
 
 const MAX_ATTEMPTS: i32 = 5;
@@ -136,6 +136,7 @@ impl WebhookDispatcher {
     }
 
     /// Process all pending deliveries concurrently using `buffer_unordered`.
+    /// Batch-loads all endpoints in a single query to avoid N+1 pattern.
     pub async fn process_pending(&self) -> anyhow::Result<()> {
         let deliveries: Vec<WebhookDelivery> = sqlx::query_as(
             r#"
@@ -144,6 +145,7 @@ impl WebhookDispatcher {
             JOIN webhook_endpoints we ON wd.endpoint_id = we.id
             WHERE wd.status = 'pending'
               AND (wd.next_attempt_at IS NULL OR wd.next_attempt_at <= NOW())
+              AND we.enabled = true
             ORDER BY wd.created_at
             LIMIT 100
             "#,
@@ -151,12 +153,46 @@ impl WebhookDispatcher {
         .fetch_all(&self.pool)
         .await?;
 
+        if deliveries.is_empty() {
+            return Ok(());
+        }
+
+        // Batch-load all unique endpoints in a single query
+        let endpoint_ids: Vec<Uuid> = deliveries
+            .iter()
+            .map(|d| d.endpoint_id)
+            .collect::<std::collections::HashSet<_>>()
+            .into_iter()
+            .collect();
+
+        let endpoints: Vec<WebhookEndpoint> =
+            sqlx::query_as("SELECT * FROM webhook_endpoints WHERE id = ANY($1) AND enabled = true")
+                .bind(&endpoint_ids)
+                .fetch_all(&self.pool)
+                .await?;
+
+        // Create HashMap for O(1) lookups
+        let endpoint_map: HashMap<Uuid, WebhookEndpoint> =
+            endpoints.into_iter().map(|ep| (ep.id, ep)).collect();
+
+        let query_count = 2; // 1 for deliveries + 1 for endpoints
+        tracing::info!(
+            delivery_count = deliveries.len(),
+            endpoint_count = endpoint_map.len(),
+            query_count = query_count,
+            "Webhook dispatcher batch-loaded endpoints (N+1 optimization)"
+        );
+
         stream::iter(deliveries)
             .map(|delivery| {
                 let dispatcher = self.clone();
+                let endpoint_map = endpoint_map.clone();
                 async move {
                     let start = std::time::Instant::now();
-                    if let Err(e) = dispatcher.attempt_delivery(&delivery).await {
+                    if let Err(e) = dispatcher
+                        .attempt_delivery_with_endpoint(&delivery, &endpoint_map)
+                        .await
+                    {
                         tracing::error!(
                             delivery_id = %delivery.id,
                             "Webhook delivery attempt error: {e}"
@@ -179,7 +215,7 @@ impl WebhookDispatcher {
 
     async fn check_rate_limit(&self, endpoint_id: Uuid, max_rate: i32) -> anyhow::Result<bool> {
         let mut conn = self.redis.get_multiplexed_async_connection().await?;
-        let key = format!("webhook_rate:{}", endpoint_id);
+        let key = format!("webhook_rate:{endpoint_id}");
 
         // Use Redis INCR to atomically increment the counter
         // If the key doesn't exist, INCR sets it to 1
@@ -204,14 +240,18 @@ impl WebhookDispatcher {
         Ok(allowed)
     }
 
-    async fn attempt_delivery(&self, delivery: &WebhookDelivery) -> anyhow::Result<()> {
+    async fn attempt_delivery_with_endpoint(
+        &self,
+        delivery: &WebhookDelivery,
+        endpoint_map: &HashMap<Uuid, WebhookEndpoint>,
+    ) -> anyhow::Result<()> {
         // Check rate limit first
         if !self
             .check_rate_limit(delivery.endpoint_id, delivery.max_delivery_rate)
             .await?
         {
             // Rate limit exceeded, delay this delivery to next cycle
-            let next_cycle = Utc::now() + chrono::Duration::seconds(30); // Next processing cycle
+            let next_cycle = Utc::now() + chrono::Duration::seconds(30);
             sqlx::query(
                 r#"
                 UPDATE webhook_deliveries
@@ -231,12 +271,26 @@ impl WebhookDispatcher {
             return Ok(());
         }
 
-        let endpoint: WebhookEndpoint =
-            sqlx::query_as("SELECT * FROM webhook_endpoints WHERE id = $1")
-                .bind(delivery.endpoint_id)
-                .fetch_one(&self.pool)
-                .await?;
+        let endpoint = match endpoint_map.get(&delivery.endpoint_id) {
+            Some(ep) => ep,
+            None => {
+                tracing::warn!(
+                    delivery_id = %delivery.id,
+                    endpoint_id = %delivery.endpoint_id,
+                    "Endpoint not found in batch-loaded map"
+                );
+                return Ok(());
+            }
+        };
 
+        self.send_webhook(delivery, endpoint).await
+    }
+
+    async fn send_webhook(
+        &self,
+        delivery: &WebhookDelivery,
+        endpoint: &WebhookEndpoint,
+    ) -> anyhow::Result<()> {
         let body = serde_json::to_string(&delivery.payload)?;
 
         // Extract timestamp from payload (OutgoingPayload includes timestamp field)
@@ -314,6 +368,42 @@ impl WebhookDispatcher {
         Ok(())
     }
 
+    async fn attempt_delivery(&self, delivery: &WebhookDelivery) -> anyhow::Result<()> {
+        // Check rate limit first
+        if !self
+            .check_rate_limit(delivery.endpoint_id, delivery.max_delivery_rate)
+            .await?
+        {
+            // Rate limit exceeded, delay this delivery to next cycle
+            let next_cycle = Utc::now() + chrono::Duration::seconds(30); // Next processing cycle
+            sqlx::query(
+                r#"
+                UPDATE webhook_deliveries
+                SET next_attempt_at = $1
+                WHERE id = $2
+                "#,
+            )
+            .bind(next_cycle)
+            .bind(delivery.id)
+            .execute(&self.pool)
+            .await?;
+            tracing::debug!(
+                delivery_id = %delivery.id,
+                endpoint_id = %delivery.endpoint_id,
+                "Rate limit exceeded, delaying delivery to next cycle"
+            );
+            return Ok(());
+        }
+
+        let endpoint: WebhookEndpoint =
+            sqlx::query_as("SELECT * FROM webhook_endpoints WHERE id = $1")
+                .bind(delivery.endpoint_id)
+                .fetch_one(&self.pool)
+                .await?;
+
+        self.send_webhook(delivery, &endpoint).await
+    }
+
     async fn handle_failure(
         &self,
         delivery: &WebhookDelivery,
@@ -366,7 +456,11 @@ impl WebhookDispatcher {
         Ok(())
     }
 
-    async fn endpoints_for_event(&self, event_type: &str, transaction_data: &serde_json::Value) -> anyhow::Result<Vec<WebhookEndpoint>> {
+    async fn endpoints_for_event(
+        &self,
+        event_type: &str,
+        transaction_data: &serde_json::Value,
+    ) -> anyhow::Result<Vec<WebhookEndpoint>> {
         let all_endpoints: Vec<WebhookEndpoint> = sqlx::query_as(
             r#"
             SELECT * FROM webhook_endpoints
@@ -389,7 +483,11 @@ impl WebhookDispatcher {
         Ok(filtered_endpoints)
     }
 
-    pub fn matches_filters(&self, endpoint: &WebhookEndpoint, transaction_data: &serde_json::Value) -> bool {
+    pub fn matches_filters(
+        &self,
+        endpoint: &WebhookEndpoint,
+        transaction_data: &serde_json::Value,
+    ) -> bool {
         // If no filter rules, accept all
         let Some(filter_rules) = &endpoint.filter_rules else {
             return true;
@@ -404,7 +502,8 @@ impl WebhookDispatcher {
         if let Some(asset_codes) = filter_rules.get("asset_codes") {
             if let Some(asset_codes_array) = asset_codes.as_array() {
                 if let Some(asset_code) = asset_code {
-                    let allowed = asset_codes_array.iter()
+                    let allowed = asset_codes_array
+                        .iter()
                         .filter_map(|v| v.as_str())
                         .any(|allowed_code| allowed_code == asset_code);
                     if !allowed {
@@ -419,7 +518,7 @@ impl WebhookDispatcher {
 
         // Check min_amount filter
         if let Some(min_amount_str) = filter_rules.get("min_amount").and_then(|v| v.as_str()) {
-            if let Some(min_amount) = min_amount_str.parse::<f64>().ok() {
+            if let Ok(min_amount) = min_amount_str.parse::<f64>() {
                 if let Some(amount) = amount {
                     if amount < min_amount {
                         return false;
@@ -433,7 +532,7 @@ impl WebhookDispatcher {
 
         // Check max_amount filter
         if let Some(max_amount_str) = filter_rules.get("max_amount").and_then(|v| v.as_str()) {
-            if let Some(max_amount) = max_amount_str.parse::<f64>().ok() {
+            if let Ok(max_amount) = max_amount_str.parse::<f64>() {
                 if let Some(amount) = amount {
                     if amount > max_amount {
                         return false;
@@ -489,7 +588,7 @@ impl WebhookDispatcher {
         const ROLLING_WINDOW: i64 = 100;
         const AUTO_DISABLE_THRESHOLD: f64 = 10.0;
 
-        let row = sqlx::query!(
+        let row = sqlx::query(
             r#"
             SELECT
                 COUNT(*)                                    AS total,
@@ -502,14 +601,20 @@ impl WebhookDispatcher {
                 LIMIT $2
             ) recent
             "#,
-            endpoint_id,
-            ROLLING_WINDOW,
         )
+        .bind(endpoint_id)
+        .bind(ROLLING_WINDOW)
         .fetch_one(&self.pool)
         .await?;
 
-        let total = row.total.unwrap_or(0) as i32;
-        let successes = row.successes.unwrap_or(0) as f64;
+        let total = row
+            .try_get::<Option<i64>, _>("total")
+            .unwrap_or(None)
+            .unwrap_or(0) as i32;
+        let successes = row
+            .try_get::<Option<i64>, _>("successes")
+            .unwrap_or(None)
+            .unwrap_or(0) as f64;
         let success_rate = if total > 0 {
             (successes / total as f64) * 100.0
         } else {
@@ -542,15 +647,15 @@ impl WebhookDispatcher {
         .await?;
 
         if success_rate < AUTO_DISABLE_THRESHOLD && total >= 100 {
-            let updated = sqlx::query!(
+            let updated = sqlx::query(
                 r#"
                 UPDATE webhook_endpoints
                 SET enabled = FALSE, updated_at = NOW()
                 WHERE id = $1 AND enabled = TRUE
                 RETURNING id
                 "#,
-                endpoint_id,
             )
+            .bind(endpoint_id)
             .fetch_optional(&self.pool)
             .await?;
 
@@ -591,9 +696,9 @@ const SIGNATURE_VERSION: &str = "v1";
 /// The signed content is formatted as: `timestamp.body`
 /// where timestamp is included in the X-Webhook-Timestamp header.
 fn sign_payload_with_version(secret: &str, timestamp: &str, body: &str) -> String {
-    let signed_content = format!("{}.{}", timestamp, body);
+    let signed_content = format!("{timestamp}.{body}");
     let signature_hex = sign_payload_v1(secret, &signed_content);
-    format!("{}={}", SIGNATURE_VERSION, signature_hex)
+    format!("{SIGNATURE_VERSION}={signature_hex}")
 }
 
 /// Compute HMAC-SHA256 hex signature (v1).
@@ -643,8 +748,8 @@ mod tests {
         );
         assert_eq!(
             signature.len(),
-            68,
-            "v1 signature should be 68 chars (4 for 'v1=' + 64 for sha256 hex)"
+            67,
+            "v1 signature should be 67 chars (3 for 'v1=' + 64 for sha256 hex)"
         );
     }
 
@@ -734,9 +839,15 @@ mod tests {
         );
     }
 
-    #[test]
-    fn test_filter_no_rules_accepts_all() {
-        let dispatcher = WebhookDispatcher::new(sqlx::PgPool::new("dummy").unwrap(), "redis://dummy").unwrap();
+    #[tokio::test]
+    async fn test_filter_no_rules_accepts_all() {
+        let dispatcher = WebhookDispatcher::new(
+            sqlx::postgres::PgPoolOptions::new()
+                .connect_lazy("postgres://dummy")
+                .unwrap(),
+            "redis://dummy",
+        )
+        .unwrap();
         let endpoint = WebhookEndpoint {
             id: Uuid::new_v4(),
             url: "http://example.com".to_string(),
@@ -756,9 +867,15 @@ mod tests {
         assert!(dispatcher.matches_filters(&endpoint, &transaction_data));
     }
 
-    #[test]
-    fn test_filter_asset_codes_matches() {
-        let dispatcher = WebhookDispatcher::new(sqlx::PgPool::new("dummy").unwrap(), "redis://dummy").unwrap();
+    #[tokio::test]
+    async fn test_filter_asset_codes_matches() {
+        let dispatcher = WebhookDispatcher::new(
+            sqlx::postgres::PgPoolOptions::new()
+                .connect_lazy("postgres://dummy")
+                .unwrap(),
+            "redis://dummy",
+        )
+        .unwrap();
         let endpoint = WebhookEndpoint {
             id: Uuid::new_v4(),
             url: "http://example.com".to_string(),
@@ -789,9 +906,15 @@ mod tests {
         assert!(!dispatcher.matches_filters(&endpoint, &btc_transaction));
     }
 
-    #[test]
-    fn test_filter_min_amount() {
-        let dispatcher = WebhookDispatcher::new(sqlx::PgPool::new("dummy").unwrap(), "redis://dummy").unwrap();
+    #[tokio::test]
+    async fn test_filter_min_amount() {
+        let dispatcher = WebhookDispatcher::new(
+            sqlx::postgres::PgPoolOptions::new()
+                .connect_lazy("postgres://dummy")
+                .unwrap(),
+            "redis://dummy",
+        )
+        .unwrap();
         let endpoint = WebhookEndpoint {
             id: Uuid::new_v4(),
             url: "http://example.com".to_string(),
@@ -817,9 +940,15 @@ mod tests {
         assert!(!dispatcher.matches_filters(&endpoint, &small_transaction));
     }
 
-    #[test]
-    fn test_filter_combined_rules() {
-        let dispatcher = WebhookDispatcher::new(sqlx::PgPool::new("dummy").unwrap(), "redis://dummy").unwrap();
+    #[tokio::test]
+    async fn test_filter_combined_rules() {
+        let dispatcher = WebhookDispatcher::new(
+            sqlx::postgres::PgPoolOptions::new()
+                .connect_lazy("postgres://dummy")
+                .unwrap(),
+            "redis://dummy",
+        )
+        .unwrap();
         let endpoint = WebhookEndpoint {
             id: Uuid::new_v4(),
             url: "http://example.com".to_string(),
@@ -881,8 +1010,10 @@ pub struct EndpointHealth {
 }
 
 /// Return health scores for all webhook endpoints.
-pub async fn list_endpoint_health(pool: &PgPool) -> Result<Vec<EndpointHealth>, crate::error::AppError> {
-    let rows = sqlx::query!(
+pub async fn list_endpoint_health(
+    pool: &PgPool,
+) -> Result<Vec<EndpointHealth>, crate::error::AppError> {
+    let rows = sqlx::query(
         r#"
         SELECT id, url, enabled, success_rate, total_deliveries, last_success_at
         FROM webhook_endpoints
@@ -895,15 +1026,20 @@ pub async fn list_endpoint_health(pool: &PgPool) -> Result<Vec<EndpointHealth>, 
 
     Ok(rows
         .into_iter()
-        .map(|r| EndpointHealth {
-            id: r.id,
-            url: r.url,
-            enabled: r.enabled,
-            success_rate: r.success_rate
+        .map(|r: sqlx::postgres::PgRow| EndpointHealth {
+            id: r.get("id"),
+            url: r.get("url"),
+            enabled: r.get("enabled"),
+            success_rate: r
+                .try_get::<sqlx::types::BigDecimal, _>("success_rate")
+                .ok()
                 .map(|v| v.to_string().parse::<f64>().unwrap_or(0.0))
                 .unwrap_or(100.0),
-            total_deliveries: r.total_deliveries.unwrap_or(0),
-            last_success_at: r.last_success_at,
+            total_deliveries: r
+                .try_get::<Option<i32>, _>("total_deliveries")
+                .unwrap_or(None)
+                .unwrap_or(0),
+            last_success_at: r.try_get("last_success_at").unwrap_or(None),
         })
         .collect())
 }
@@ -913,27 +1049,32 @@ pub async fn get_endpoint_health(
     pool: &PgPool,
     endpoint_id: Uuid,
 ) -> Result<EndpointHealth, crate::error::AppError> {
-    let r = sqlx::query!(
+    let r = sqlx::query(
         r#"
         SELECT id, url, enabled, success_rate, total_deliveries, last_success_at
         FROM webhook_endpoints
         WHERE id = $1
         "#,
-        endpoint_id,
     )
+    .bind(endpoint_id)
     .fetch_optional(pool)
     .await
     .map_err(crate::error::AppError::Database)?
-    .ok_or_else(|| crate::error::AppError::NotFound(format!("Endpoint {} not found", endpoint_id)))?;
+    .ok_or_else(|| crate::error::AppError::NotFound(format!("Endpoint {endpoint_id} not found")))?;
 
     Ok(EndpointHealth {
-        id: r.id,
-        url: r.url,
-        enabled: r.enabled,
-        success_rate: r.success_rate
+        id: r.get("id"),
+        url: r.get("url"),
+        enabled: r.get("enabled"),
+        success_rate: r
+            .try_get::<sqlx::types::BigDecimal, _>("success_rate")
+            .ok()
             .map(|v| v.to_string().parse::<f64>().unwrap_or(0.0))
             .unwrap_or(100.0),
-        total_deliveries: r.total_deliveries.unwrap_or(0),
-        last_success_at: r.last_success_at,
+        total_deliveries: r
+            .try_get::<Option<i32>, _>("total_deliveries")
+            .unwrap_or(None)
+            .unwrap_or(0),
+        last_success_at: r.try_get("last_success_at").unwrap_or(None),
     })
 }

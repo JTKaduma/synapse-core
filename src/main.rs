@@ -1,4 +1,3 @@
-use axum::routing::{get, post};
 use clap::Parser;
 use opentelemetry::trace::TracerProvider as _;
 use sqlx::migrate::Migrator;
@@ -12,15 +11,16 @@ use synapse_core::{
     middleware::idempotency::IdempotencyService,
     schemas,
     secrets::SecretsStore,
-    services::{FeatureFlagService, LeaderElection, SettlementService, WebhookDispatcher},
+    services::{FeatureFlagService, SettlementService, WebhookDispatcher},
     stellar::HorizonClient,
-    telemetry, ApiState, AppState, ReadinessState,
+    telemetry, AppState, ReadinessState,
 };
 use tokio::sync::broadcast;
 use tower_http::cors::{AllowHeaders, AllowMethods, AllowOrigin, CorsLayer};
 use tracing_opentelemetry::OpenTelemetryLayer;
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 use utoipa::OpenApi;
+use utoipa_swagger_ui::SwaggerUi;
 mod cli;
 use cli::{BackupCommands, Cli, Commands, DbCommands, TxCommands};
 
@@ -29,17 +29,15 @@ use cli::{BackupCommands, Cli, Commands, DbCommands, TxCommands};
 #[openapi(
     paths(
         handlers::health,
-        handlers::settlements::list_settlements,
-        handlers::settlements::get_settlement,
         handlers::webhook::handle_webhook,
         handlers::webhook::callback,
         handlers::webhook::get_transaction,
+        handlers::webhook::list_transactions,
     ),
     components(
         schemas(
             handlers::HealthStatus,
             handlers::DbPoolStats,
-            handlers::settlements::Pagination,
             handlers::settlements::SettlementListResponse,
             handlers::webhook::WebhookPayload,
             handlers::webhook::WebhookResponse,
@@ -159,12 +157,22 @@ async fn serve(config: config::Config) -> anyhow::Result<()> {
     );
 
     // Initialize Settlement Service
-    let _settlement_service = SettlementService::new(pool.clone());
+    let _settlement_service = SettlementService::with_config(
+        pool.clone(),
+        config.settlement_max_batch_size,
+        config.settlement_min_tx_count,
+    );
 
     // Start background settlement worker
     let settlement_pool = pool.clone();
+    let settlement_max_batch = config.settlement_max_batch_size;
+    let settlement_min_tx = config.settlement_min_tx_count;
     tokio::spawn(async move {
-        let service = SettlementService::new(settlement_pool);
+        let service = SettlementService::with_config(
+            settlement_pool,
+            settlement_max_batch,
+            settlement_min_tx,
+        );
         let mut interval = tokio::time::interval(tokio::time::Duration::from_secs(3600)); // Default to hourly
         loop {
             interval.tick().await;
@@ -197,8 +205,8 @@ async fn serve(config: config::Config) -> anyhow::Result<()> {
     tracing::info!("Webhook dispatcher background worker started");
 
     // Initialize metrics (OTLP exporter + pool stats background task)
-    let _metrics_handle = metrics::init_metrics()
-        .map_err(|e| anyhow::anyhow!("Failed to initialize metrics: {}", e))?;
+    let metrics_handle = metrics::init_metrics()
+        .map_err(|e| anyhow::anyhow!("Failed to initialize metrics: {e}"))?;
     tracing::info!("Metrics initialized successfully");
     metrics::spawn_pool_metrics_task(pool.clone(), 30);
 
@@ -238,8 +246,9 @@ async fn serve(config: config::Config) -> anyhow::Result<()> {
         tracing::warn!("Failed to warm cache on startup: {:?}", e);
     }
 
-    // Create broadcast channel for WebSocket notifications
-    // Channel capacity of 100 - slow clients will miss old messages (backpressure handling)
+    // Create broadcast channel for WebSocket notifications.
+    // Capacity of 100: slow subscribers will receive a RecvError::Lagged — the WS handler
+    // detects this, notifies the client with a "messages_dropped" frame, and offers resync.
     let (tx_broadcast, _) = broadcast::channel::<TransactionStatusUpdate>(100);
     tracing::info!("WebSocket broadcast channel initialized");
 
@@ -287,10 +296,39 @@ async fn serve(config: config::Config) -> anyhow::Result<()> {
         tenant_configs: std::sync::Arc::new(tokio::sync::RwLock::new(
             std::collections::HashMap::new(),
         )),
+        secrets_store,
         pending_queue_depth: pending_queue_depth.clone(),
         current_batch_size: current_batch_size.clone(),
+        secrets_store,
         metrics_handle,
+        ws_connection_count: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),
     };
+
+    // Load tenant configs on startup
+    if let Err(e) = app_state.load_tenant_configs().await {
+        tracing::warn!("Failed to load tenant configs on startup: {}", e);
+    } else {
+        let count = app_state.tenant_configs.read().await.len();
+        tracing::info!(count, "Tenant configs loaded on startup");
+    }
+
+    // Background task: reload tenant configs every 60 seconds
+    let tenant_reload_state = app_state.clone();
+    tokio::spawn(async move {
+        let mut interval = tokio::time::interval(tokio::time::Duration::from_secs(60));
+        loop {
+            interval.tick().await;
+            match tenant_reload_state.load_tenant_configs().await {
+                Ok(()) => {
+                    let count = tenant_reload_state.tenant_configs.read().await.len();
+                    tracing::debug!(count, "Tenant configs reloaded (background task)");
+                }
+                Err(e) => {
+                    tracing::error!("Failed to reload tenant configs: {}", e);
+                }
+            }
+        }
+    });
 
     tokio::spawn(async move {
         pool_monitor_task(monitor_pool).await;
@@ -317,7 +355,36 @@ async fn serve(config: config::Config) -> anyhow::Result<()> {
     );
     let _processor_shutdown = processor_pool.start();
 
+    // Register and start scheduled jobs
+    let scheduler = synapse_core::services::JobScheduler::new();
+    let stellar_account = std::env::var("RECONCILIATION_ACCOUNT").ok();
+
+    if let Some(account) = stellar_account {
+        let recon_job = synapse_core::services::reconciliation::ReconciliationJob {
+            pool: pool.clone(),
+            horizon_client: horizon_client.clone(),
+            stellar_account: account,
+        };
+        if let Err(e) = scheduler.register_job(Box::new(recon_job)).await {
+            tracing::warn!("Failed to register reconciliation job: {}", e);
+        }
+    } else {
+        tracing::info!(
+            "RECONCILIATION_ACCOUNT not set — daily reconciliation job not scheduled"
+        );
+    }
+    if let Err(e) = scheduler.start().await {
+        tracing::warn!("Failed to start job scheduler: {}", e);
+    }
+    tracing::info!("Job scheduler started");
+
     let app = synapse_core::create_app(app_state);
+
+    // Mount Swagger UI at /api/docs and serve OpenAPI JSON at /api/docs/openapi.json
+    let app = app.merge(
+        SwaggerUi::new("/api/docs")
+            .url("/api/docs/openapi.json", ApiDoc::openapi()),
+    );
 
     // Configure CORS if allowed origins are specified.
     let app = if !config.cors_allowed_origins.is_empty() {
@@ -345,8 +412,71 @@ async fn serve(config: config::Config) -> anyhow::Result<()> {
     let addr = SocketAddr::from(([0, 0, 0, 0], config.server_port));
     tracing::info!("listening on {}", addr);
 
+    // Clone readiness state for the shutdown signal handler
+    let readiness_for_shutdown = app_state.readiness.clone();
+
+    // Build the shutdown signal: fires on SIGTERM or SIGINT, then drains
+    let shutdown_signal = async move {
+        let ctrl_c = async {
+            tokio::signal::ctrl_c()
+                .await
+                .expect("failed to install CTRL+C handler");
+        };
+
+        #[cfg(unix)]
+        let sigterm = async {
+            tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+                .expect("failed to install SIGTERM handler")
+                .recv()
+                .await;
+        };
+
+        #[cfg(not(unix))]
+        let sigterm = std::future::pending::<()>();
+
+        tokio::select! {
+            _ = ctrl_c => tracing::info!("Received SIGINT, starting graceful shutdown"),
+            _ = sigterm => tracing::info!("Received SIGTERM, starting graceful shutdown"),
+        }
+
+        // Mark service as not ready so /ready returns 503 immediately
+        readiness_for_shutdown.set_not_ready();
+        tracing::info!("Readiness set to not_ready; waiting for in-flight requests to drain");
+
+        // Wait for the configured drain timeout (default 30s)
+        readiness_for_shutdown.wait_for_drain().await;
+    };
+
     axum::Server::bind(&addr)
         .serve(app.into_make_service_with_connect_info::<SocketAddr>())
+        .with_graceful_shutdown(async move {
+            // Wait for SIGTERM or SIGINT
+            #[cfg(unix)]
+            {
+                use tokio::signal::unix::{signal, SignalKind};
+                let mut sigterm =
+                    signal(SignalKind::terminate()).expect("failed to register SIGTERM handler");
+                let mut sigint =
+                    signal(SignalKind::interrupt()).expect("failed to register SIGINT handler");
+                tokio::select! {
+                    _ = sigterm.recv() => tracing::info!("Received SIGTERM"),
+                    _ = sigint.recv() => tracing::info!("Received SIGINT"),
+                }
+            }
+            #[cfg(not(unix))]
+            {
+                tokio::signal::ctrl_c()
+                    .await
+                    .expect("failed to register Ctrl-C handler");
+                tracing::info!("Received Ctrl-C");
+            }
+
+            // If not already draining (e.g. /admin/drain was not called), start drain now
+            if !readiness.is_draining() {
+                readiness.start_drain();
+            }
+            readiness.wait_for_drain().await;
+        })
         .await?;
 
     // Flush and shut down the OTel exporter on clean exit.

@@ -67,11 +67,7 @@ impl QueryTier {
 /// On timeout the counter `DB_QUERY_TIMEOUT_TOTAL` is incremented, the
 /// sanitised SQL label is logged (no parameter values), and the connection is
 /// dropped so the pool can reclaim it rather than leaving it in a hung state.
-pub async fn with_timeout<F, T>(
-    tier: QueryTier,
-    sql_label: &str,
-    fut: F,
-) -> Result<T>
+pub async fn with_timeout<F, T>(tier: QueryTier, sql_label: &str, fut: F) -> Result<T>
 where
     F: std::future::Future<Output = Result<T>>,
 {
@@ -94,6 +90,18 @@ where
 
 // --- Tenant Queries --------------------------------------------------------
 
+/// Look up whether an API key exists and belongs to an active tenant.
+/// Returns `Ok(true)` if valid, `Ok(false)` if not found or inactive.
+pub async fn lookup_api_key(pool: &PgPool, api_key: &str) -> Result<bool> {
+    let row = sqlx::query(
+        "SELECT 1 FROM tenants WHERE api_key = $1 AND is_active = true LIMIT 1",
+    )
+    .bind(api_key)
+    .fetch_optional(pool)
+    .await?;
+    Ok(row.is_some())
+}
+
 pub async fn get_all_tenant_configs(pool: &PgPool) -> Result<Vec<TenantConfig>> {
     let configs = sqlx::query_as::<_, TenantConfig>(
         "SELECT tenant_id, name, webhook_secret, stellar_account, rate_limit_per_minute, is_active FROM tenants WHERE is_active = true",
@@ -101,6 +109,26 @@ pub async fn get_all_tenant_configs(pool: &PgPool) -> Result<Vec<TenantConfig>> 
     .fetch_all(pool)
     .await?;
     Ok(configs)
+}
+
+/// Set the tenant context on a connection so PostgreSQL RLS policies fire correctly.
+/// Pass `None` for admin connections that should bypass RLS.
+pub async fn set_tenant_context(
+    conn: &mut sqlx::pool::PoolConnection<sqlx::Postgres>,
+    tenant_id: Option<uuid::Uuid>,
+    is_admin: bool,
+) -> Result<()> {
+    if is_admin {
+        sqlx::query("SELECT set_config('app.is_admin', 'true', true)")
+            .execute(&mut **conn)
+            .await?;
+    } else if let Some(tid) = tenant_id {
+        sqlx::query("SELECT set_config('app.tenant_id', $1, true), set_config('app.is_admin', 'false', true)")
+            .bind(tid.to_string())
+            .execute(&mut **conn)
+            .await?;
+    }
+    Ok(())
 }
 
 // --- Transaction Queries ---
@@ -168,6 +196,8 @@ pub async fn insert_transaction(pool: &PgPool, tx: &Transaction) -> Result<Trans
             Ok(result)
         }),
     )
+    .await
+}
 
 pub async fn get_transaction(pool: &PgPool, id: Uuid) -> Result<Transaction> {
     with_timeout(
@@ -378,6 +408,125 @@ pub async fn list_settlements(pool: &PgPool, limit: i64, offset: i64) -> Result<
     .await
 }
 
+/// Cursor-based settlement listing used by the settlements handler.
+pub async fn list_settlements_cursor(
+    pool: &PgPool,
+    limit: i64,
+    cursor: Option<(DateTime<Utc>, Uuid)>,
+    backward: bool,
+) -> Result<Vec<Settlement>> {
+    with_timeout(
+        QueryTier::Read,
+        "SELECT * FROM settlements [cursor-paginated]",
+        async {
+            if let Some((ts, id)) = cursor {
+                if !backward {
+                    sqlx::query_as::<_, Settlement>(
+                        "SELECT * FROM settlements WHERE (created_at, id) < ($1, $2) ORDER BY created_at DESC, id DESC LIMIT $3",
+                    )
+                    .bind(ts).bind(id).bind(limit)
+                    .fetch_all(pool).await
+                } else {
+                    let mut rows = sqlx::query_as::<_, Settlement>(
+                        "SELECT * FROM settlements WHERE (created_at, id) > ($1, $2) ORDER BY created_at ASC, id ASC LIMIT $3",
+                    )
+                    .bind(ts).bind(id).bind(limit)
+                    .fetch_all(pool).await?;
+                    rows.reverse();
+                    Ok(rows)
+                }
+            } else if !backward {
+                sqlx::query_as::<_, Settlement>(
+                    "SELECT * FROM settlements ORDER BY created_at DESC, id DESC LIMIT $1",
+                )
+                .bind(limit)
+                .fetch_all(pool).await
+            } else {
+                let mut rows = sqlx::query_as::<_, Settlement>(
+                    "SELECT * FROM settlements ORDER BY created_at ASC, id ASC LIMIT $1",
+                )
+                .bind(limit)
+                .fetch_all(pool).await?;
+                rows.reverse();
+                Ok(rows)
+            }
+        },
+    )
+    .await
+}
+
+/// Update settlement status with reason; returns the updated settlement.
+pub async fn update_settlement_status(
+    pool: &PgPool,
+    id: Uuid,
+    new_status: &str,
+    reason: Option<&str>,
+    new_total: Option<&sqlx::types::BigDecimal>,
+    actor: &str,
+) -> Result<Settlement> {
+    let mut db_tx = pool.begin().await?;
+
+    let current = sqlx::query_as::<_, Settlement>("SELECT * FROM settlements WHERE id = $1 FOR UPDATE")
+        .bind(id)
+        .fetch_optional(&mut *db_tx)
+        .await?
+        .ok_or(sqlx::Error::RowNotFound)?;
+
+    // Preserve original amount on first adjustment
+    let original_total = if current.original_total_amount.is_none() && new_total.is_some() {
+        Some(current.total_amount.clone())
+    } else {
+        current.original_total_amount.clone()
+    };
+
+    let updated = sqlx::query_as::<_, Settlement>(
+        r#"
+        UPDATE settlements SET
+            status = $1,
+            dispute_reason = COALESCE($2, dispute_reason),
+            total_amount = COALESCE($3, total_amount),
+            original_total_amount = COALESCE($4, original_total_amount),
+            reviewed_by = $5,
+            reviewed_at = NOW(),
+            updated_at = NOW()
+        WHERE id = $6
+        RETURNING *
+        "#,
+    )
+    .bind(new_status)
+    .bind(reason)
+    .bind(new_total)
+    .bind(original_total)
+    .bind(actor)
+    .bind(id)
+    .fetch_one(&mut *db_tx)
+    .await?;
+
+    // If voided, release transactions back to unsettled
+    if new_status == "voided" {
+        sqlx::query(
+            "UPDATE transactions SET settlement_id = NULL, updated_at = NOW() WHERE settlement_id = $1",
+        )
+        .bind(id)
+        .execute(&mut *db_tx)
+        .await?;
+    }
+
+    crate::db::audit::AuditLog::log(
+        &mut db_tx,
+        id,
+        crate::db::audit::ENTITY_SETTLEMENT,
+        "status_update",
+        Some(serde_json::json!({ "status": current.status })),
+        Some(serde_json::json!({ "status": new_status, "reason": reason })),
+        actor,
+    )
+    .await?;
+
+    db_tx.commit().await?;
+    Ok(updated)
+}
+
 pub async fn get_unique_assets_to_settle(pool: &PgPool) -> Result<Vec<String>> {
     with_timeout(
         QueryTier::Read,
@@ -480,7 +629,10 @@ pub async fn search_transactions(
                 where_clause
             );
 
-            // Build data query with pagination
+            // Build data query with pagination.
+            // ORDER BY is aligned with idx_transactions_status_asset_created
+            // (status, asset_code, created_at DESC) so the planner can use an
+            // index scan instead of a sequential scan + sort.
             let data_query = format!(
                 "SELECT * FROM transactions {} ORDER BY created_at DESC, id DESC LIMIT ${}",
                 where_clause, param_count
@@ -612,14 +764,185 @@ mod tests {
     }
 }
 
+// --- Audit Log Search Query ---
+
+/// Parameters for searching audit logs across all entities.
+#[derive(Debug, Default)]
+pub struct AuditSearchParams<'a> {
+    pub actor: Option<&'a str>,
+    pub action: Option<&'a str>,
+    pub from_date: Option<DateTime<Utc>>,
+    pub to_date: Option<DateTime<Utc>>,
+    pub entity_type: Option<&'a str>,
+    pub limit: i64,
+    /// Cursor: (timestamp, id) of the last seen row for keyset pagination.
+    pub cursor: Option<(DateTime<Utc>, Uuid)>,
+}
+
+/// A single row returned by the audit search query.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AuditLogRow {
+    pub id: Uuid,
+    pub entity_id: Uuid,
+    pub entity_type: String,
+    pub action: String,
+    pub old_val: Option<serde_json::Value>,
+    pub new_val: Option<serde_json::Value>,
+    pub actor: String,
+    pub timestamp: DateTime<Utc>,
+}
+
+/// Search audit logs with optional filters and cursor-based pagination.
+/// Returns `(total_count, rows)`.
+#[allow(clippy::too_many_arguments)]
+pub async fn search_audit_logs(
+    pool: &PgPool,
+    params: &AuditSearchParams<'_>,
+) -> Result<(i64, Vec<AuditLogRow>)> {
+    with_timeout(
+        QueryTier::Read,
+        "search_audit_logs [dynamic WHERE clause]",
+        async {
+            let mut conditions: Vec<String> = Vec::new();
+            let mut p = 1usize;
+
+            if params.actor.is_some() {
+                conditions.push(format!("actor = ${p}"));
+                p += 1;
+            }
+            if params.action.is_some() {
+                conditions.push(format!("action = ${p}"));
+                p += 1;
+            }
+            if params.from_date.is_some() {
+                conditions.push(format!("timestamp >= ${p}"));
+                p += 1;
+            }
+            if params.to_date.is_some() {
+                conditions.push(format!("timestamp <= ${p}"));
+                p += 1;
+            }
+            if params.entity_type.is_some() {
+                conditions.push(format!("entity_type = ${p}"));
+                p += 1;
+            }
+            if params.cursor.is_some() {
+                conditions.push(format!("(timestamp, id) < (${p}, ${})", p + 1));
+                p += 2;
+            }
+
+            let where_clause = if conditions.is_empty() {
+                String::new()
+            } else {
+                format!("WHERE {}", conditions.join(" AND "))
+            };
+
+            // Bind helper — avoids repeating the bind sequence twice.
+            macro_rules! bind_filters {
+                ($q:expr) => {{
+                    let mut q = $q;
+                    if let Some(v) = params.actor {
+                        q = q.bind(v);
+                    }
+                    if let Some(v) = params.action {
+                        q = q.bind(v);
+                    }
+                    if let Some(v) = params.from_date {
+                        q = q.bind(v);
+                    }
+                    if let Some(v) = params.to_date {
+                        q = q.bind(v);
+                    }
+                    if let Some(v) = params.entity_type {
+                        q = q.bind(v);
+                    }
+                    if let Some((ts, id)) = params.cursor {
+                        q = q.bind(ts).bind(id);
+                    }
+                    q
+                }};
+            }
+
+            // Total count (ignores cursor so the caller always gets the full
+            // result-set size for the given filters).
+            let count_sql = format!(
+                "SELECT COUNT(*) FROM audit_logs {}",
+                // Strip cursor condition from count query
+                if conditions.is_empty() {
+                    String::new()
+                } else {
+                    let non_cursor: Vec<_> = conditions
+                        .iter()
+                        .filter(|c| !c.contains("timestamp, id"))
+                        .cloned()
+                        .collect();
+                    if non_cursor.is_empty() {
+                        String::new()
+                    } else {
+                        format!("WHERE {}", non_cursor.join(" AND "))
+                    }
+                }
+            );
+
+            // Re-bind without cursor for count
+            let mut count_q = sqlx::query(&count_sql);
+            if let Some(v) = params.actor {
+                count_q = count_q.bind(v);
+            }
+            if let Some(v) = params.action {
+                count_q = count_q.bind(v);
+            }
+            if let Some(v) = params.from_date {
+                count_q = count_q.bind(v);
+            }
+            if let Some(v) = params.to_date {
+                count_q = count_q.bind(v);
+            }
+            if let Some(v) = params.entity_type {
+                count_q = count_q.bind(v);
+            }
+
+            let total: i64 = count_q.fetch_one(pool).await?.try_get(0)?;
+
+            // Data query with cursor + limit
+            let data_sql = format!(
+                "SELECT id, entity_id, entity_type, action, old_val, new_val, actor, timestamp \
+                 FROM audit_logs {where_clause} \
+                 ORDER BY timestamp DESC, id DESC \
+                 LIMIT ${p}"
+            );
+
+            let data_q = bind_filters!(sqlx::query(&data_sql)).bind(params.limit);
+            let rows = data_q.fetch_all(pool).await?;
+
+            let logs = rows
+                .into_iter()
+                .map(|row| AuditLogRow {
+                    id: row.get("id"),
+                    entity_id: row.get("entity_id"),
+                    entity_type: row.get("entity_type"),
+                    action: row.get("action"),
+                    old_val: row.get("old_val"),
+                    new_val: row.get("new_val"),
+                    actor: row.get("actor"),
+                    timestamp: row.get("timestamp"),
+                })
+                .collect();
+
+            Ok((total, logs))
+        },
+    )
+    .await
+}
+
 // --- Audit Log Queries ---
 
-/// Retrieve audit logs for a specific entity
+/// Retrieve audit logs for a specific entity using cursor-based pagination on (timestamp, id).
 pub async fn get_audit_logs(
     pool: &PgPool,
     entity_id: Uuid,
     limit: i64,
-    offset: i64,
+    cursor: Option<(DateTime<Utc>, Uuid)>,
 ) -> Result<
     Vec<(
         Uuid,
@@ -632,20 +955,37 @@ pub async fn get_audit_logs(
         DateTime<Utc>,
     )>,
 > {
-    let rows = sqlx::query(
-        r#"
-        SELECT id, entity_id, entity_type, action, old_val, new_val, actor, timestamp
-        FROM audit_logs
-        WHERE entity_id = $1
-        ORDER BY timestamp DESC
-        LIMIT $2 OFFSET $3
-        "#,
-    )
-    .bind(entity_id)
-    .bind(limit)
-    .bind(offset)
-    .fetch_all(pool)
-    .await?;
+    let rows = if let Some((ts, cid)) = cursor {
+        sqlx::query(
+            r#"
+            SELECT id, entity_id, entity_type, action, old_val, new_val, actor, timestamp
+            FROM audit_logs
+            WHERE entity_id = $1 AND (timestamp, id) < ($2, $3)
+            ORDER BY timestamp DESC, id DESC
+            LIMIT $4
+            "#,
+        )
+        .bind(entity_id)
+        .bind(ts)
+        .bind(cid)
+        .bind(limit)
+        .fetch_all(pool)
+        .await?
+    } else {
+        sqlx::query(
+            r#"
+            SELECT id, entity_id, entity_type, action, old_val, new_val, actor, timestamp
+            FROM audit_logs
+            WHERE entity_id = $1
+            ORDER BY timestamp DESC, id DESC
+            LIMIT $2
+            "#,
+        )
+        .bind(entity_id)
+        .bind(limit)
+        .fetch_all(pool)
+        .await?
+    };
 
     Ok(rows
         .into_iter()
@@ -662,6 +1002,115 @@ pub async fn get_audit_logs(
             )
         })
         .collect())
+}
+
+// --- Bulk Status Update ---
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct BulkUpdateError {
+    pub transaction_id: Uuid,
+    pub error: String,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct BulkUpdateResult {
+    pub updated: usize,
+    pub failed: usize,
+    pub errors: Vec<BulkUpdateError>,
+}
+
+/// Bulk update transaction statuses, validating each transition individually.
+/// Uses a single UPDATE ... WHERE id = ANY($1) for the valid subset, then
+/// audit-logs each successful update within the same transaction.
+pub async fn bulk_update_transaction_status(
+    pool: &PgPool,
+    transaction_ids: &[Uuid],
+    new_status: &str,
+    reason: Option<&str>,
+    actor: &str,
+) -> Result<BulkUpdateResult> {
+    use crate::validation::state_machine::validate_status_transition;
+
+    // Fetch current statuses for all requested IDs in one query
+    let rows = sqlx::query(
+        "SELECT id, status FROM transactions WHERE id = ANY($1)",
+    )
+    .bind(transaction_ids)
+    .fetch_all(pool)
+    .await?;
+
+    let current: std::collections::HashMap<Uuid, String> = rows
+        .into_iter()
+        .map(|r| (r.get::<Uuid, _>("id"), r.get::<String, _>("status")))
+        .collect();
+
+    let mut valid_ids: Vec<Uuid> = Vec::new();
+    let mut old_statuses: std::collections::HashMap<Uuid, String> = std::collections::HashMap::new();
+    let mut errors: Vec<BulkUpdateError> = Vec::new();
+
+    for &id in transaction_ids {
+        match current.get(&id) {
+            None => errors.push(BulkUpdateError {
+                transaction_id: id,
+                error: "transaction not found".to_string(),
+            }),
+            Some(from) => match validate_status_transition(from, new_status) {
+                Ok(_) => {
+                    old_statuses.insert(id, from.clone());
+                    valid_ids.push(id);
+                }
+                Err(e) => errors.push(BulkUpdateError {
+                    transaction_id: id,
+                    error: e.to_string(),
+                }),
+            },
+        }
+    }
+
+    if valid_ids.is_empty() {
+        return Ok(BulkUpdateResult {
+            updated: 0,
+            failed: errors.len(),
+            errors,
+        });
+    }
+
+    let mut db_tx = pool.begin().await?;
+
+    sqlx::query(
+        "UPDATE transactions SET status = $1, updated_at = NOW() WHERE id = ANY($2)",
+    )
+    .bind(new_status)
+    .bind(&valid_ids)
+    .execute(&mut *db_tx)
+    .await?;
+
+    for &id in &valid_ids {
+        let old_status = old_statuses.get(&id).map(|s| s.as_str()).unwrap_or("unknown");
+        let mut new_val = serde_json::json!({ "status": new_status });
+        if let Some(r) = reason {
+            new_val["reason"] = serde_json::json!(r);
+        }
+        AuditLog::log(
+            &mut db_tx,
+            id,
+            ENTITY_TRANSACTION,
+            "status_update",
+            Some(serde_json::json!({ "status": old_status })),
+            Some(new_val),
+            actor,
+        )
+        .await?;
+    }
+
+    db_tx.commit().await?;
+
+    let updated = valid_ids.len();
+    Ok(BulkUpdateResult {
+        updated,
+        failed: errors.len(),
+        errors,
+    })
 }
 
 // --- Aggregate Queries (Cacheable) ---

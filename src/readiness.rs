@@ -100,8 +100,8 @@ impl ReadinessState {
     ) -> Result<(), InitializationError> {
         tracing::info!("Starting initialization checks...");
 
-        // Check 1: Verify migrations completed (implicit - pool is already initialized)
-        tracing::info!("✓ Database migrations already verified during pool initialization");
+        // Check 1: Verify pool warm-up completed (create_pool blocks until min_connections are established)
+        tracing::info!("✓ Database pool warm-up already completed during pool creation");
 
         // Check 2: Verify Redis connection
         match self.check_redis(redis_url).await {
@@ -144,19 +144,15 @@ impl ReadinessState {
 
     /// Check Redis connectivity by sending PING
     async fn check_redis(&self, redis_url: &str) -> Result<(), String> {
-        use redis::Commands;
-        
         match redis::Client::open(redis_url) {
             Ok(client) => match client.get_connection() {
-                Ok(mut conn) => {
-                    match conn.ping::<()>() {
-                        Ok(_) => Ok(()),
-                        Err(e) => Err(format!("Redis PING failed: {}", e)),
-                    }
-                }
-                Err(e) => Err(format!("Redis connection failed: {}", e)),
+                Ok(mut conn) => match redis::cmd("PING").query::<String>(&mut conn) {
+                    Ok(_) => Ok(()),
+                    Err(e) => Err(format!("Redis PING failed: {e}")),
+                },
+                Err(e) => Err(format!("Redis connection failed: {e}")),
             },
-            Err(e) => Err(format!("Redis client initialization failed: {}", e)),
+            Err(e) => Err(format!("Redis client initialization failed: {e}")),
         }
     }
 
@@ -175,7 +171,7 @@ impl ReadinessState {
                     Err(format!("Horizon returned status: {}", response.status()))
                 }
             }
-            Err(e) => Err(format!("Horizon connectivity check failed: {}", e)),
+            Err(e) => Err(format!("Horizon connectivity check failed: {e}")),
         }
     }
 }
@@ -189,7 +185,7 @@ pub enum InitializationError {
 impl std::fmt::Display for InitializationError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            InitializationError::DatabaseCheck(msg) => write!(f, "Database check failed: {}", msg),
+            InitializationError::DatabaseCheck(msg) => write!(f, "Database check failed: {msg}"),
         }
     }
 }
@@ -198,6 +194,44 @@ impl Default for ReadinessState {
     fn default() -> Self {
         Self::new()
     }
+}
+
+/// Axum handler: POST /admin/drain
+///
+/// Kubernetes preStop hook target. Sets readiness to false, starts the drain timer,
+/// and returns immediately. The process will exit after the drain timeout elapses.
+pub async fn drain_handler(
+    axum::extract::State(state): axum::extract::State<crate::ApiState>,
+) -> impl axum::response::IntoResponse {
+    use axum::http::StatusCode;
+    use axum::Json;
+
+    if state.app_state.readiness.is_draining() {
+        return (
+            StatusCode::OK,
+            Json(serde_json::json!({
+                "status": "already_draining",
+                "drain_timeout_secs": state.app_state.readiness.drain_timeout().as_secs()
+            })),
+        );
+    }
+
+    let timeout = state.app_state.readiness.start_drain();
+
+    // Spawn a task that exits the process after the drain timeout
+    tokio::spawn(async move {
+        tokio::time::sleep(timeout).await;
+        tracing::info!("Drain timeout elapsed — shutting down process");
+        std::process::exit(0);
+    });
+
+    (
+        StatusCode::OK,
+        Json(serde_json::json!({
+            "status": "draining",
+            "drain_timeout_secs": timeout.as_secs()
+        })),
+    )
 }
 
 /// Extension trait to easily add readiness state to AppState
