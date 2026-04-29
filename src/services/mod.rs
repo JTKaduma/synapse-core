@@ -1,6 +1,7 @@
 pub mod backup;
 pub mod feature_flags;
 pub mod processor;
+pub mod query_cache;
 pub mod scheduler;
 pub mod settlement;
 pub mod transaction_processor;
